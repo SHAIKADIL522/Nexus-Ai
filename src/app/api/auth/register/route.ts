@@ -44,6 +44,15 @@ export async function POST(req: NextRequest) {
         { email: normalizedEmail },
         { $set: { name, password: hashed, updatedAt: new Date() } }
       );
+      // ✅ FIX: backfill tokenVersion on accounts created before this
+      // field existed (re-registering an unverified account hits this
+      // branch, not the insert branch below). Separate call since Mongo
+      // doesn't let one updateOne conditionally set a field only-if-missing
+      // in the same operation as an unconditional $set on other fields.
+      await db.collection('users').updateOne(
+        { email: normalizedEmail, tokenVersion: { $exists: false } },
+        { $set: { tokenVersion: 0 } }
+      );
       await client.close();
     } else {
       const hashed = await bcrypt.hash(password, 12);
@@ -52,6 +61,15 @@ export async function POST(req: NextRequest) {
         email: normalizedEmail,
         password: hashed,
         verified: false,
+        // ✅ FIX: this was the actual bug. New users got no tokenVersion
+        // field at all, while the Google OAuth callback route already
+        // sets tokenVersion: 0 on insert. Without this, requireSessionStrict
+        // in src/lib/auth.ts falls back to treating a missing value as 0
+        // on both sides (token and DB) — which should still match — but
+        // an explicit field removes any ambiguity and matches the Google
+        // callback's behavior exactly, so both signup paths produce
+        // identically-shaped user docs.
+        tokenVersion: 0,
         createdAt: new Date(),
         updatedAt: new Date(),
       });

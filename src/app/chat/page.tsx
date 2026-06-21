@@ -1,7 +1,7 @@
 'use client';
 import { useState, useRef, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Send, Mic, MicOff, Copy, RefreshCw, Trash2, Plus, Search, Sparkles, User, Volume2 } from 'lucide-react';
+import { Send, Mic, MicOff, Copy, RefreshCw, Trash2, Plus, Search, Sparkles, User, Volume2, Pencil, Loader2 } from 'lucide-react';
 import AppLayout from '@/components/layout/AppLayout';
 
 interface Message { id: string; role: 'user'|'assistant'; content: string; ts: Date; }
@@ -43,45 +43,164 @@ function MessageBubble({ msg, onCopy }: { msg: Message; onCopy: (t:string)=>void
   );
 }
 
+// ---- Persistence helpers ----
+// All talk to /api/conversations[/[id]]. Dates come back from the API as
+// ISO strings (JSON has no Date type) — reviveMessageDates fixes that up
+// so the rest of the component can keep using msg.ts.toLocaleTimeString()
+// etc. exactly as it already did.
+function reviveMessageDates(messages: Array<Omit<Message,'ts'> & { ts: string | Date }>): Message[] {
+  return messages.map(m => ({ ...m, ts: new Date(m.ts) }));
+}
+
+function reviveChat(raw: any): Chat {
+  return {
+    id: raw.id,
+    title: raw.title,
+    messages: reviveMessageDates(raw.messages || []),
+    ts: new Date(raw.updatedAt || raw.createdAt || Date.now()),
+  };
+}
+
 export default function ChatPage() {
-  const [chats, setChats] = useState<Chat[]>([
-    {id:'1',title:'NVIDIA NIM Integration',messages:[{id:'m1',role:'assistant',content:'Hello! I\'m Nexus AI, powered by NVIDIA NIM. How can I help you today? I can assist with research, analysis, coding, writing, and much more.',ts:new Date()}],ts:new Date()},
-  ]);
-  const [activeId, setActiveId] = useState('1');
+  const [chats, setChats] = useState<Chat[]>([]);
+  const [activeId, setActiveId] = useState<string>('');
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [loadingChats, setLoadingChats] = useState(true);
   const [listening, setListening] = useState(false);
   const [search, setSearch] = useState('');
   const [provider, setProvider] = useState<'nvidia'|'openrouter'>('nvidia');
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
 
-  const activeChat = chats.find(c=>c.id===activeId)!;
+  const activeChat = chats.find(c=>c.id===activeId);
 
   useEffect(()=>{bottomRef.current?.scrollIntoView({behavior:'smooth'});},[activeChat?.messages]);
 
-  function newChat() {
+  // ---- Load conversations on mount ----
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/conversations', { credentials: 'include' });
+        if (!res.ok) {
+          // Not fatal — fall back to a fresh local chat so the page is
+          // still usable even if persistence is down (matches the
+          // resilience pattern already used for /api/ai-chat failures).
+          if (!cancelled) setLoadingChats(false);
+          return;
+        }
+        const data = await res.json();
+        if (cancelled) return;
+
+        const loaded: Chat[] = (data.conversations || []).map(reviveChat);
+        if (loaded.length > 0) {
+          setChats(loaded);
+          setActiveId(loaded[0].id);
+        }
+        // If loaded.length === 0, leave chats empty — newChat() or the
+        // first sendMessage() will create the first conversation, rather
+        // than seeding a hardcoded welcome chat that doesn't exist in Mongo.
+      } catch {
+        // network error — same fallback as above
+      } finally {
+        if (!cancelled) setLoadingChats(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  async function newChat() {
+    try {
+      const res = await fetch('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ title: 'New conversation', messages: [] }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const chat = reviveChat(data.conversation);
+        setChats(prev=>[chat, ...prev]);
+        setActiveId(chat.id);
+        return;
+      }
+    } catch {
+      // fall through to local-only chat below
+    }
+    // Persistence failed — still let the user start chatting locally
+    // rather than blocking the button entirely.
     const id = Date.now().toString();
-    setChats(prev=>[...prev,{id,title:'New conversation',messages:[{id:'sys',role:'assistant',content:'New conversation started. How can I help you?',ts:new Date()}],ts:new Date()}]);
+    setChats(prev=>[{id,title:'New conversation',messages:[],ts:new Date()}, ...prev]);
     setActiveId(id);
+  }
+
+  // Persists the given chat's current messages/title to the backend.
+  // Fire-and-forget from the caller's perspective (errors logged, not
+  // surfaced as a blocking UI state) — losing a save shouldn't interrupt
+  // an in-progress conversation.
+  async function persistChat(chat: Chat) {
+    try {
+      await fetch(`/api/conversations/${chat.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ title: chat.title, messages: chat.messages }),
+      });
+    } catch (err) {
+      console.error('[chat] failed to persist conversation:', err);
+    }
   }
 
   async function sendMessage() {
     if(!input.trim()||loading) return;
+
+    // If there's no active chat yet (fresh session, load failed, etc.),
+    // create one first so the very first message has somewhere to land.
+    let currentChat = activeChat;
+    if (!currentChat) {
+      try {
+        const res = await fetch('/api/conversations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ title: 'New conversation', messages: [] }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          currentChat = reviveChat(data.conversation);
+          setChats(prev=>[currentChat!, ...prev]);
+          setActiveId(currentChat.id);
+        } else {
+          currentChat = { id: Date.now().toString(), title: 'New conversation', messages: [], ts: new Date() };
+          setChats(prev=>[currentChat!, ...prev]);
+          setActiveId(currentChat.id);
+        }
+      } catch {
+        currentChat = { id: Date.now().toString(), title: 'New conversation', messages: [], ts: new Date() };
+        setChats(prev=>[currentChat!, ...prev]);
+        setActiveId(currentChat.id);
+      }
+    }
+    const chatId = currentChat.id;
+
     const userMsg: Message = {id:Date.now().toString(),role:'user',content:input.trim(),ts:new Date()};
     const newTitle = input.trim().slice(0,40);
 
     // Snapshot history INCLUDING the new user message for the API call
-    const history = [...activeChat.messages, userMsg];
+    const history = [...currentChat.messages, userMsg];
+    const isFirstMessage = currentChat.messages.length === 0;
 
-    setChats(prev=>prev.map(c=>c.id===activeId?{...c,title:c.messages.length<=1?newTitle:c.title,messages:[...c.messages,userMsg]}:c));
+    setChats(prev=>prev.map(c=>c.id===chatId?{...c,title:isFirstMessage?newTitle:c.title,messages:[...c.messages,userMsg]}:c));
     setInput('');
     setLoading(true);
 
     // Create placeholder assistant message we'll stream tokens into
     const aiMsgId = (Date.now()+1).toString();
     const aiMsg: Message = { id: aiMsgId, role: 'assistant', content: '', ts: new Date() };
-    setChats(prev=>prev.map(c=>c.id===activeId?{...c,messages:[...c.messages,aiMsg]}:c));
+    setChats(prev=>prev.map(c=>c.id===chatId?{...c,messages:[...c.messages,aiMsg]}:c));
 
     try {
       const res = await fetch('/api/ai-chat', {
@@ -128,7 +247,7 @@ export default function ChatPage() {
                        ?? '';
             if (delta) {
               fullText += delta;
-              setChats(prev=>prev.map(c=>c.id===activeId
+              setChats(prev=>prev.map(c=>c.id===chatId
                 ? {...c, messages: c.messages.map(m=>m.id===aiMsgId?{...m,content:fullText}:m)}
                 : c
               ));
@@ -140,17 +259,38 @@ export default function ChatPage() {
       }
 
       if (!fullText) {
-        setChats(prev=>prev.map(c=>c.id===activeId
-          ? {...c, messages: c.messages.map(m=>m.id===aiMsgId?{...m,content:'(No response received.)'}:m)}
+        fullText = '(No response received.)';
+        setChats(prev=>prev.map(c=>c.id===chatId
+          ? {...c, messages: c.messages.map(m=>m.id===aiMsgId?{...m,content:fullText}:m)}
           : c
         ));
       }
+
+      // Persist the completed exchange (user msg + final assistant text).
+      // Read the latest state via the functional setChats pattern already
+      // in use, then fire the save off the resulting chat snapshot.
+      setChats(prev => {
+        const updated = prev.map(c=>c.id===chatId
+          ? {...c, messages: c.messages.map(m=>m.id===aiMsgId?{...m,content:fullText}:m)}
+          : c
+        );
+        const finalChat = updated.find(c => c.id === chatId);
+        if (finalChat) persistChat(finalChat);
+        return updated;
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Something went wrong.';
-      setChats(prev=>prev.map(c=>c.id===activeId
+      setChats(prev=>prev.map(c=>c.id===chatId
         ? {...c, messages: c.messages.map(m=>m.id===aiMsgId?{...m,content:`⚠️ ${message}`}:m)}
         : c
       ));
+      // Persist even the error state — better than the conversation
+      // looking shorter on reload than what the user actually saw.
+      setChats(prev => {
+        const finalChat = prev.find(c => c.id === chatId);
+        if (finalChat) persistChat(finalChat);
+        return prev;
+      });
     } finally {
       setLoading(false);
     }
@@ -190,7 +330,61 @@ export default function ChatPage() {
 
   function copyMsg(text:string){navigator.clipboard.writeText(text);}
 
+  async function deleteChat(id: string) {
+    const wasActive = activeId === id;
+    setChats(prev=>prev.filter(c=>c.id!==id));
+    if (wasActive) {
+      const remaining = chats.filter(c=>c.id!==id);
+      setActiveId(remaining.length > 0 ? remaining[0].id : '');
+    }
+    try {
+      await fetch(`/api/conversations/${id}`, { method: 'DELETE', credentials: 'include' });
+    } catch (err) {
+      console.error('[chat] failed to delete conversation on server:', err);
+      // Not rolling back the optimistic local removal — a conversation
+      // that's gone from the UI but still in Mongo will simply reappear
+      // on next full reload, which is a less confusing failure mode than
+      // a delete button that silently un-deletes itself.
+    }
+  }
+
+  function startRename(chat: Chat) {
+    setRenamingId(chat.id);
+    setRenameValue(chat.title);
+  }
+
+  async function commitRename() {
+    if (!renamingId) return;
+    const title = renameValue.trim();
+    if (!title) { setRenamingId(null); return; }
+
+    setChats(prev=>prev.map(c=>c.id===renamingId?{...c,title}:c));
+    const idToRename = renamingId;
+    setRenamingId(null);
+
+    try {
+      await fetch(`/api/conversations/${idToRename}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ title }),
+      });
+    } catch (err) {
+      console.error('[chat] failed to persist rename:', err);
+    }
+  }
+
   const filteredChats = chats.filter(c=>c.title.toLowerCase().includes(search.toLowerCase()));
+
+  if (loadingChats) {
+    return (
+      <AppLayout>
+        <div className="flex items-center justify-center h-[calc(100vh-52px)]">
+          <Loader2 className="size-6 text-violet-400 animate-spin" />
+        </div>
+      </AppLayout>
+    );
+  }
 
   return (
     <AppLayout>
@@ -209,6 +403,9 @@ export default function ChatPage() {
             </div>
           </div>
           <div className="flex-1 overflow-y-auto p-2 custom-scrollbar space-y-1">
+            {filteredChats.length === 0 && (
+              <p className="text-xs text-white/25 text-center mt-6 px-3">No conversations yet. Start typing below to begin one.</p>
+            )}
             {filteredChats.map(chat=>(
               <div key={chat.id}
                 role="button"
@@ -216,12 +413,35 @@ export default function ChatPage() {
                 onClick={()=>setActiveId(chat.id)}
                 onKeyDown={e=>{if(e.key==='Enter'||e.key===' ')setActiveId(chat.id);}}
                 className={`w-full text-left px-3 py-2.5 rounded-xl text-xs transition-all group cursor-pointer ${activeId===chat.id?'nav-item-active':'text-white/40 hover:text-white/70 hover:bg-white/5'}`}>
-                <div className="flex items-center justify-between">
-                  <span className="truncate">{chat.title}</span>
-                  <button onClick={e=>{e.stopPropagation();setChats(prev=>prev.filter(c=>c.id!==chat.id));if(activeId===chat.id&&chats.length>1)setActiveId(chats[0].id);}}
-                    className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 transition-all flex-shrink-0">
-                    <Trash2 className="size-3"/>
-                  </button>
+                <div className="flex items-center justify-between gap-1">
+                  {renamingId === chat.id ? (
+                    <input
+                      autoFocus
+                      value={renameValue}
+                      onChange={e=>setRenameValue(e.target.value)}
+                      onClick={e=>e.stopPropagation()}
+                      onKeyDown={e=>{
+                        if(e.key==='Enter'){e.preventDefault();commitRename();}
+                        if(e.key==='Escape'){setRenamingId(null);}
+                      }}
+                      onBlur={commitRename}
+                      className="flex-1 bg-white/10 rounded px-1.5 py-0.5 text-xs text-white focus:outline-none"
+                    />
+                  ) : (
+                    <span className="truncate">{chat.title}</span>
+                  )}
+                  {renamingId !== chat.id && (
+                    <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 flex-shrink-0">
+                      <button onClick={e=>{e.stopPropagation();startRename(chat);}}
+                        className="p-0.5 hover:text-violet-400 transition-all">
+                        <Pencil className="size-3"/>
+                      </button>
+                      <button onClick={e=>{e.stopPropagation();deleteChat(chat.id);}}
+                        className="p-0.5 hover:text-red-400 transition-all">
+                        <Trash2 className="size-3"/>
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <p className="text-[10px] text-white/20 mt-0.5">{chat.ts.toLocaleDateString()}</p>
               </div>
@@ -234,7 +454,7 @@ export default function ChatPage() {
           {/* Header */}
           <div className="flex items-center justify-between px-5 py-3" style={{borderBottom:'1px solid rgba(255,255,255,0.06)'}}>
             <div>
-              <h2 className="text-sm font-semibold text-white font-display truncate">{activeChat?.title}</h2>
+              <h2 className="text-sm font-semibold text-white font-display truncate">{activeChat?.title || 'New conversation'}</h2>
               <p className="text-[11px] text-white/30">Powered by NVIDIA NIM · LLaMA 3.1 70B</p>
             </div>
             <div className="flex items-center gap-2">
@@ -247,6 +467,11 @@ export default function ChatPage() {
 
           {/* Messages */}
           <div className="flex-1 overflow-y-auto p-5 space-y-5 custom-scrollbar">
+            {!activeChat && (
+              <div className="flex items-center justify-center h-full">
+                <p className="text-sm text-white/30">Start a new conversation or pick one from the sidebar.</p>
+              </div>
+            )}
             {activeChat?.messages.map(msg=>(
               <MessageBubble key={msg.id} msg={msg} onCopy={copyMsg}/>
             ))}

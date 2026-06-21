@@ -17,6 +17,12 @@ const QUICK_ACTIONS = [
   {icon:<BookOpen className="size-5 text-emerald-400"/>,label:'Knowledge',desc:'Your document vault',href:'/knowledge-vault',color:'border-emerald-500/20'},
 ];
 
+// NOTE: STATS, RECENT, and the AI Status list below are still hardcoded
+// mock data — that was true before this fix and is unchanged here. Only
+// userName was wired to real data, since that's what was reported broken.
+// Wiring stats/recent-activity/AI-status to real collections is a
+// separate, larger task (would need actual usage-tracking endpoints that
+// don't exist yet) — flagging so this isn't mistaken for "fully live."
 const STATS = [
   {label:'Active Tasks',val:'12',delta:'+3 today',icon:<CheckCircle2 className="size-4 text-emerald-400"/>,color:'text-emerald-400'},
   {label:'Documents',val:'34',delta:'+2 this week',icon:<FileText className="size-4 text-amber-400"/>,color:'text-amber-400'},
@@ -33,9 +39,41 @@ const RECENT = [
 ];
 
 export default function DashboardPage() {
-  const [userName] = useState('Alex');
+  // ✅ FIX: was `useState('Alex')` — hardcoded placeholder, never replaced
+  // with a real value. Now fetched from /api/settings, the same endpoint
+  // src/app/settings/page.tsx already uses, which returns both `email`
+  // and `settings.profile.name`. Falls back to the email's local-part
+  // (before the @) if profile.name is empty, so a user who registered
+  // but never set a display name still sees something better than
+  // "Unnamed" or a blank greeting.
+  const [userName, setUserName] = useState('');
+  const [nameLoading, setNameLoading] = useState(true);
   const [time,setTime]=useState(new Date());
   useEffect(()=>{const t=setInterval(()=>setTime(new Date()),60000);return()=>clearInterval(t);},[]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/settings', { credentials: 'include' });
+        if (!res.ok) {
+          if (!cancelled) setNameLoading(false);
+          return;
+        }
+        const data = await res.json();
+        if (cancelled) return;
+
+        const name = data.settings?.profile?.name?.trim();
+        const emailLocalPart = data.email ? String(data.email).split('@')[0] : '';
+        setUserName(name || emailLocalPart || 'there');
+      } catch {
+        if (!cancelled) setUserName('there');
+      } finally {
+        if (!cancelled) setNameLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   return (
     <AppLayout>
@@ -47,7 +85,7 @@ export default function DashboardPage() {
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <h1 className="text-2xl sm:text-3xl font-black font-display mb-1">
-                  {getGreeting()}, {userName} 👋
+                  {getGreeting()}{nameLoading ? '' : `, ${userName}`} 👋
                 </h1>
                 <p className="text-white/40 text-sm">
                   {time.toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'})} · NVIDIA NIM is ready

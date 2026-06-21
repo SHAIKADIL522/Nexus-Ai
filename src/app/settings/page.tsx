@@ -1,10 +1,10 @@
 'use client';
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   User, Shield, Mic, Cpu, Bell, Palette, LogOut, Save,
-  Eye, EyeOff, Check, ChevronRight, Sparkles, Moon, Sun,
-  Trash2,
+  Eye, EyeOff, Check, ChevronRight, Sparkles, Moon, Sun, Monitor,
+  Trash2, Loader2, AlertTriangle,
 } from 'lucide-react';
 import AppLayout from '@/components/layout/AppLayout';
 
@@ -47,25 +47,44 @@ function SettingRow({ label, description, children }: { label: string; descripti
   );
 }
 
+// ---- Types matching src/models/Settings.ts ----
+interface ProfileSettings { name: string; bio: string; avatar: string; }
+interface VoiceSettings { enabled: boolean; continuousListening: boolean; voiceOutput: boolean; language: string; rate: number; pitch: number; }
+interface ModelSettings { primary: string; fallback: string; temperature: number; maxTokens: number; streamResponses: boolean; }
+interface NotificationSettings { researchComplete: boolean; agentUpdates: boolean; documentProcessed: boolean; weeklyDigest: boolean; emailNotifs: boolean; browserNotifs: boolean; }
+interface ThemeSettings { mode: 'dark' | 'light' | 'system'; accentColor: string; reducedMotion: boolean; compactMode: boolean; }
+
+const NVIDIA_MODELS = [
+  { value: 'meta/llama-3.1-70b-instruct', label: 'LLaMA 3.1 70B (Default)', badge: 'Recommended' },
+  { value: 'meta/llama-3.1-8b-instruct',  label: 'LLaMA 3.1 8B (Fast)',    badge: 'Fast' },
+  { value: 'nvidia/llama-3.1-nemotron-70b-instruct', label: 'Nemotron 70B (Reasoning)', badge: 'Powerful' },
+];
+
 export default function SettingsPage() {
   const [tab, setTab] = useState<SettingsTab>('profile');
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
 
-  // Profile
-  const [profile, setProfile] = useState({ name: 'Alex Johnson', email: 'alex@example.com', bio: 'Senior AI Engineer · Building the future', avatar: '' });
+  // Profile — email is read-only here, sourced from /api/settings (which reads it off the user doc)
+  const [email, setEmail] = useState('');
+  const [profile, setProfile] = useState<ProfileSettings>({ name: '', bio: '', avatar: '' });
 
   // Security
   const [showPw, setShowPw] = useState(false);
   const [passwords, setPasswords] = useState({ current: '', newPw: '', confirm: '' });
+  const [pwSaving, setPwSaving] = useState(false);
+  const [pwMessage, setPwMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Voice
-  const [voiceSettings, setVoiceSettings] = useState({
+  const [voiceSettings, setVoiceSettings] = useState<VoiceSettings>({
     enabled: true, continuousListening: false, voiceOutput: true,
     language: 'en-US', rate: 1, pitch: 1,
   });
 
   // Model
-  const [modelSettings, setModelSettings] = useState({
+  const [modelSettings, setModelSettings] = useState<ModelSettings>({
     primary: 'meta/llama-3.1-70b-instruct',
     fallback: 'openrouter',
     temperature: 0.7,
@@ -74,24 +93,175 @@ export default function SettingsPage() {
   });
 
   // Notifications
-  const [notifications, setNotifications] = useState({
+  const [notifications, setNotifications] = useState<NotificationSettings>({
     researchComplete: true, agentUpdates: true, documentProcessed: true,
     weeklyDigest: false, emailNotifs: true, browserNotifs: true,
   });
 
   // Theme
-  const [theme, setTheme] = useState({ mode: 'dark', accentColor: 'violet', reducedMotion: false, compactMode: false });
+  const [theme, setTheme] = useState<ThemeSettings>({ mode: 'dark', accentColor: 'violet', reducedMotion: false, compactMode: false });
+
+  // Account
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
+  const [deleting, setDeleting] = useState(false);
+  const [logoutAllLoading, setLogoutAllLoading] = useState(false);
+  const [accountMessage, setAccountMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // ---- Load settings on mount ----
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/settings', { credentials: 'include' });
+        if (!res.ok) {
+          if (res.status === 401) {
+            setLoadError('Your session has expired. Please log in again.');
+          } else {
+            setLoadError('Failed to load settings.');
+          }
+          return;
+        }
+        const data = await res.json();
+        if (cancelled) return;
+
+        const s = data.settings;
+        setProfile(s.profile);
+        setVoiceSettings(s.voice);
+        setModelSettings(s.model);
+        setNotifications(s.notifications);
+        setTheme(s.theme);
+        if (data.email) setEmail(data.email);
+      } catch {
+        if (!cancelled) setLoadError('Could not reach the server. Check your connection.');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ---- Generic save for a single section ----
+  const saveSection = useCallback(async (section: 'profile' | 'voice' | 'model' | 'notifications' | 'theme', value: unknown) => {
+    setSaving(true);
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ [section]: value }),
+      });
+      if (!res.ok) throw new Error('Save failed');
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch {
+      setLoadError('Failed to save. Please try again.');
+      setTimeout(() => setLoadError(''), 3000);
+    } finally {
+      setSaving(false);
+    }
+  }, []);
 
   function save() {
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    const sectionMap: Record<SettingsTab, { key: 'profile' | 'voice' | 'model' | 'notifications' | 'theme'; value: unknown } | null> = {
+      profile: { key: 'profile', value: profile },
+      security: null, // security has its own dedicated save flow (change password)
+      voice: { key: 'voice', value: voiceSettings },
+      model: { key: 'model', value: modelSettings },
+      notifications: { key: 'notifications', value: notifications },
+      theme: { key: 'theme', value: theme },
+      account: null,
+    };
+    const target = sectionMap[tab];
+    if (target) saveSection(target.key, target.value);
   }
 
-  const NVIDIA_MODELS = [
-    { value: 'meta/llama-3.1-70b-instruct', label: 'LLaMA 3.1 70B (Default)', badge: 'Recommended' },
-    { value: 'meta/llama-3.1-8b-instruct',  label: 'LLaMA 3.1 8B (Fast)',    badge: 'Fast' },
-    { value: 'nvidia/llama-3.1-nemotron-70b-instruct', label: 'Nemotron 70B (Reasoning)', badge: 'Powerful' },
-  ];
+  // ---- Change password ----
+  async function changePassword() {
+    setPwMessage(null);
+    if (!passwords.current || !passwords.newPw || !passwords.confirm) {
+      setPwMessage({ type: 'error', text: 'All password fields are required.' });
+      return;
+    }
+    if (passwords.newPw !== passwords.confirm) {
+      setPwMessage({ type: 'error', text: 'New password and confirmation do not match.' });
+      return;
+    }
+    if (passwords.newPw.length < 8) {
+      setPwMessage({ type: 'error', text: 'New password must be at least 8 characters.' });
+      return;
+    }
+
+    setPwSaving(true);
+    try {
+      const res = await fetch('/api/account/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ currentPassword: passwords.current, newPassword: passwords.newPw }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setPwMessage({ type: 'error', text: data.error || 'Failed to change password.' });
+        return;
+      }
+      setPwMessage({ type: 'success', text: 'Password updated successfully.' });
+      setPasswords({ current: '', newPw: '', confirm: '' });
+    } catch {
+      setPwMessage({ type: 'error', text: 'Could not reach the server.' });
+    } finally {
+      setPwSaving(false);
+    }
+  }
+
+  // ---- Logout all devices ----
+  async function logoutAllDevices() {
+    setLogoutAllLoading(true);
+    setAccountMessage(null);
+    try {
+      const res = await fetch('/api/account/logout-all', { method: 'POST', credentials: 'include' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setAccountMessage({ type: 'error', text: data.error || 'Failed to log out other devices.' });
+        return;
+      }
+      // This request's own session is now also invalid (tokenVersion bumped).
+      // Redirect to login since the current cookie no longer verifies.
+      window.location.href = '/login?notice=logged_out_everywhere';
+    } catch {
+      setAccountMessage({ type: 'error', text: 'Could not reach the server.' });
+      setLogoutAllLoading(false);
+    }
+  }
+
+  // ---- Delete account ----
+  async function deleteAccount() {
+    if (deleteConfirmText !== 'DELETE') return;
+    setDeleting(true);
+    try {
+      const res = await fetch('/api/account/delete', { method: 'DELETE', credentials: 'include' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setAccountMessage({ type: 'error', text: data.error || 'Failed to delete account.' });
+        setDeleting(false);
+        return;
+      }
+      window.location.href = '/login?notice=account_deleted';
+    } catch {
+      setAccountMessage({ type: 'error', text: 'Could not reach the server.' });
+      setDeleting(false);
+    }
+  }
+
+  if (loading) {
+    return (
+      <AppLayout>
+        <div className="flex items-center justify-center h-[60vh]">
+          <Loader2 className="size-6 text-violet-400 animate-spin" />
+        </div>
+      </AppLayout>
+    );
+  }
 
   return (
     <AppLayout>
@@ -99,6 +269,11 @@ export default function SettingsPage() {
         <div className="mb-8">
           <h1 className="text-2xl font-black font-display mb-2">Settings</h1>
           <p className="text-white/40 text-sm">Manage your profile, AI models, voice, and workspace preferences</p>
+          {loadError && (
+            <div className="mt-3 flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-red-400" style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)' }}>
+              <AlertTriangle className="size-3.5 flex-shrink-0" /> {loadError}
+            </div>
+          )}
         </div>
 
         <div className="flex flex-col lg:flex-row gap-6">
@@ -130,28 +305,35 @@ export default function SettingsPage() {
                     <div className="flex items-center gap-5">
                       <div className="size-16 rounded-2xl flex items-center justify-center text-xl font-bold flex-shrink-0"
                         style={{ background: 'linear-gradient(135deg,#4F46E5,#7C3AED)', boxShadow: '0 0 24px rgba(124,58,237,0.4)' }}>
-                        {profile.name.slice(0, 2).toUpperCase()}
+                        {(profile.name || email || '??').slice(0, 2).toUpperCase()}
                       </div>
                       <div>
-                        <p className="font-semibold text-white/85">{profile.name}</p>
-                        <p className="text-sm text-white/40">{profile.email}</p>
+                        <p className="font-semibold text-white/85">{profile.name || 'Unnamed'}</p>
+                        <p className="text-sm text-white/40">{email}</p>
                         <button className="mt-2 text-xs text-violet-400 hover:text-violet-300 transition-colors">Change avatar</button>
                       </div>
                     </div>
                     <div className="space-y-4">
-                      {[
-                        { key: 'name',  label: 'Full Name',    type: 'text',  placeholder: 'Your name' },
-                        { key: 'email', label: 'Email',        type: 'email', placeholder: 'you@example.com' },
-                        { key: 'bio',   label: 'Bio',          type: 'text',  placeholder: 'Short description' },
-                      ].map(field => (
-                        <div key={field.key}>
-                          <label className="text-xs text-white/40 uppercase tracking-wider block mb-1.5">{field.label}</label>
-                          <input type={field.type} value={(profile as any)[field.key]}
-                            onChange={e => setProfile(p => ({ ...p, [field.key]: e.target.value }))}
-                            className="w-full px-4 py-2.5 rounded-xl text-sm bg-white/5 border border-white/10 focus:outline-none focus:border-violet-500/50 text-white placeholder-white/25"
-                            placeholder={field.placeholder} />
-                        </div>
-                      ))}
+                      <div>
+                        <label className="text-xs text-white/40 uppercase tracking-wider block mb-1.5">Full Name</label>
+                        <input type="text" value={profile.name}
+                          onChange={e => setProfile(p => ({ ...p, name: e.target.value }))}
+                          className="w-full px-4 py-2.5 rounded-xl text-sm bg-white/5 border border-white/10 focus:outline-none focus:border-violet-500/50 text-white placeholder-white/25"
+                          placeholder="Your name" />
+                      </div>
+                      <div>
+                        <label className="text-xs text-white/40 uppercase tracking-wider block mb-1.5">Email</label>
+                        <input type="email" value={email} disabled readOnly
+                          className="w-full px-4 py-2.5 rounded-xl text-sm bg-white/5 border border-white/10 text-white/40 cursor-not-allowed"
+                          title="Email is tied to your account and can't be changed here" />
+                      </div>
+                      <div>
+                        <label className="text-xs text-white/40 uppercase tracking-wider block mb-1.5">Bio</label>
+                        <input type="text" value={profile.bio}
+                          onChange={e => setProfile(p => ({ ...p, bio: e.target.value }))}
+                          className="w-full px-4 py-2.5 rounded-xl text-sm bg-white/5 border border-white/10 focus:outline-none focus:border-violet-500/50 text-white placeholder-white/25"
+                          placeholder="Short description" />
+                      </div>
                     </div>
                   </div>
                 )}
@@ -183,13 +365,24 @@ export default function SettingsPage() {
                           </div>
                         </div>
                       ))}
+                      {pwMessage && (
+                        <p className={`text-xs ${pwMessage.type === 'success' ? 'text-emerald-400' : 'text-red-400'}`}>{pwMessage.text}</p>
+                      )}
+                      <div className="flex justify-end">
+                        <button onClick={changePassword} disabled={pwSaving}
+                          className="flex items-center gap-2 px-5 py-2 rounded-xl text-sm font-bold text-white transition-all hover:-translate-y-0.5 disabled:opacity-50"
+                          style={{ background: 'linear-gradient(135deg,#4F46E5,#7C3AED)', boxShadow: '0 0 16px rgba(124,58,237,0.3)' }}>
+                          {pwSaving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+                          {pwSaving ? 'Updating...' : 'Update Password'}
+                        </button>
+                      </div>
                     </div>
                     <div className="pt-4 border-t border-white/8 space-y-0">
                       <SettingRow label="Two-Factor Authentication" description="Add extra security with 2FA">
                         <span className="text-xs text-amber-400 px-2 py-1 rounded-full bg-amber-500/10 border border-amber-500/20">Not enabled</span>
                       </SettingRow>
                       <SettingRow label="Active Sessions" description="Manage devices signed into your account">
-                        <button className="text-xs text-violet-400 hover:text-violet-300 transition-colors">View sessions</button>
+                        <button onClick={() => setTab('account')} className="text-xs text-violet-400 hover:text-violet-300 transition-colors">View in Account tab</button>
                       </SettingRow>
                     </div>
                   </div>
@@ -201,7 +394,7 @@ export default function SettingsPage() {
                     <h2 className="text-base font-bold font-display">Voice Assistant Settings</h2>
                     <div className="p-4 rounded-xl mb-2 flex items-start gap-3" style={{ background: 'rgba(124,58,237,0.08)', border: '1px solid rgba(124,58,237,0.2)' }}>
                       <Mic className="size-4 text-violet-400 mt-0.5 flex-shrink-0" />
-                      <p className="text-xs text-white/60 leading-relaxed">Voice features use the browser's native Web Speech API (SpeechRecognition + SpeechSynthesis). No external API required — 100% free and private.</p>
+                      <p className="text-xs text-white/60 leading-relaxed">Voice features use the browser&apos;s native Web Speech API (SpeechRecognition + SpeechSynthesis). No external API required — 100% free and private.</p>
                     </div>
                     <SettingRow label="Enable Voice Assistant" description="Allow voice input and output"><Toggle value={voiceSettings.enabled} onChange={v => setVoiceSettings(s => ({ ...s, enabled: v }))} /></SettingRow>
                     <SettingRow label="Voice Output" description="AI speaks responses aloud"><Toggle value={voiceSettings.voiceOutput} onChange={v => setVoiceSettings(s => ({ ...s, voiceOutput: v }))} /></SettingRow>
@@ -290,11 +483,15 @@ export default function SettingsPage() {
                     <div>
                       <label className="text-xs text-white/40 uppercase tracking-wider block mb-3">Color Mode</label>
                       <div className="flex gap-3">
-                        {[['dark', <Moon className="size-4" />, 'Dark'], ['light', <Sun className="size-4" />, 'Light']].map(([val, icon, label]) => (
-                          <button key={val as string} onClick={() => setTheme(t => ({ ...t, mode: val as string }))}
+                        {([
+                          ['dark', <Moon className="size-4" key="m" />, 'Dark'],
+                          ['light', <Sun className="size-4" key="s" />, 'Light'],
+                          ['system', <Monitor className="size-4" key="sys" />, 'System'],
+                        ] as const).map(([val, icon, label]) => (
+                          <button key={val} onClick={() => setTheme(t => ({ ...t, mode: val }))}
                             className={`flex-1 flex items-center justify-center gap-2 p-3 rounded-xl text-sm font-medium transition-all ${theme.mode === val ? 'text-white' : 'text-white/40 hover:text-white/70'}`}
                             style={{ background: theme.mode === val ? 'linear-gradient(135deg,#4F46E5,#7C3AED)' : 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}>
-                            {icon as React.ReactNode}{label as string}
+                            {icon}{label}
                           </button>
                         ))}
                       </div>
@@ -318,26 +515,36 @@ export default function SettingsPage() {
                 {tab === 'account' && (
                   <div className="space-y-6">
                     <h2 className="text-base font-bold font-display">Account Management</h2>
+                    {accountMessage && (
+                      <p className={`text-xs ${accountMessage.type === 'success' ? 'text-emerald-400' : 'text-red-400'}`}>{accountMessage.text}</p>
+                    )}
                     <div className="space-y-3">
-                      {[
-                        { label: 'Export Data', desc: 'Download all your data as JSON', action: 'Export', color: 'text-white/60' },
-                        { label: 'Sign Out All Devices', desc: 'Revoke all active sessions', action: 'Sign Out', color: 'text-amber-400' },
-                      ].map(item => (
-                        <div key={item.label} className="flex items-center justify-between p-4 rounded-xl" style={{ background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.08)' }}>
-                          <div>
-                            <p className="text-sm text-white/80">{item.label}</p>
-                            <p className="text-xs text-white/35 mt-0.5">{item.desc}</p>
-                          </div>
-                          <button className={`text-xs font-semibold px-3 py-1.5 rounded-lg transition-all ${item.color} hover:bg-white/8`}>{item.action}</button>
+                      <div className="flex items-center justify-between p-4 rounded-xl" style={{ background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                        <div>
+                          <p className="text-sm text-white/80">Export Data</p>
+                          <p className="text-xs text-white/35 mt-0.5">Download all your data as JSON</p>
                         </div>
-                      ))}
+                        <button className="text-xs font-semibold px-3 py-1.5 rounded-lg transition-all text-white/60 hover:bg-white/8">Export</button>
+                      </div>
+                      <div className="flex items-center justify-between p-4 rounded-xl" style={{ background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                        <div>
+                          <p className="text-sm text-white/80">Sign Out All Devices</p>
+                          <p className="text-xs text-white/35 mt-0.5">Revoke all active sessions, including this one</p>
+                        </div>
+                        <button onClick={logoutAllDevices} disabled={logoutAllLoading}
+                          className="flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-lg transition-all text-amber-400 hover:bg-white/8 disabled:opacity-50">
+                          {logoutAllLoading ? <Loader2 className="size-3.5 animate-spin" /> : null}
+                          {logoutAllLoading ? 'Signing out...' : 'Sign Out'}
+                        </button>
+                      </div>
                       <div className="p-4 rounded-xl" style={{ background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.2)' }}>
                         <div className="flex items-center justify-between">
                           <div>
                             <p className="text-sm text-red-400">Delete Account</p>
                             <p className="text-xs text-white/35 mt-0.5">Permanently delete your account and all data</p>
                           </div>
-                          <button className="flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-lg text-red-400 hover:bg-red-500/10 transition-all">
+                          <button onClick={() => setDeleteModalOpen(true)}
+                            className="flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-lg text-red-400 hover:bg-red-500/10 transition-all">
                             <Trash2 className="size-3.5" /> Delete
                           </button>
                         </div>
@@ -346,13 +553,14 @@ export default function SettingsPage() {
                   </div>
                 )}
 
-                {/* Save button (all tabs except account) */}
-                {tab !== 'account' && (
+                {/* Save button (all tabs except account/security, which have their own dedicated actions) */}
+                {tab !== 'account' && tab !== 'security' && (
                   <div className="mt-6 flex justify-end">
-                    <button onClick={save}
-                      className="flex items-center gap-2 px-6 py-2.5 rounded-xl text-sm font-bold text-white transition-all hover:-translate-y-0.5"
+                    <button onClick={save} disabled={saving}
+                      className="flex items-center gap-2 px-6 py-2.5 rounded-xl text-sm font-bold text-white transition-all hover:-translate-y-0.5 disabled:opacity-60"
                       style={{ background: saved ? 'rgba(16,185,129,0.8)' : 'linear-gradient(135deg,#4F46E5,#7C3AED)', boxShadow: '0 0 20px rgba(124,58,237,0.3)' }}>
-                      {saved ? <><Check className="size-4" /> Saved!</> : <><Save className="size-4" /> Save Changes</>}
+                      {saving ? <Loader2 className="size-4 animate-spin" /> : saved ? <Check className="size-4" /> : <Save className="size-4" />}
+                      {saving ? 'Saving...' : saved ? 'Saved!' : 'Save Changes'}
                     </button>
                   </div>
                 )}
@@ -361,6 +569,47 @@ export default function SettingsPage() {
           </div>
         </div>
       </div>
+
+      {/* Delete account confirmation modal */}
+      <AnimatePresence>
+        {deleteModalOpen && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.6)' }}
+            onClick={() => !deleting && setDeleteModalOpen(false)}>
+            <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
+              onClick={e => e.stopPropagation()}
+              className="w-full max-w-md p-6 rounded-2xl"
+              style={{ background: 'rgba(15,15,20,0.98)', border: '1px solid rgba(239,68,68,0.3)' }}>
+              <div className="flex items-start gap-3 mb-4">
+                <div className="size-10 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: 'rgba(239,68,68,0.12)' }}>
+                  <AlertTriangle className="size-5 text-red-400" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white">Delete your account?</h3>
+                  <p className="text-xs text-white/40 mt-1">This permanently deletes your profile, settings, conversations, and file metadata. This cannot be undone.</p>
+                </div>
+              </div>
+              <label className="text-xs text-white/40 uppercase tracking-wider block mb-1.5">Type DELETE to confirm</label>
+              <input type="text" value={deleteConfirmText} onChange={e => setDeleteConfirmText(e.target.value)}
+                disabled={deleting}
+                className="w-full px-4 py-2.5 rounded-xl text-sm bg-white/5 border border-white/10 focus:outline-none focus:border-red-500/50 text-white placeholder-white/25 mb-5"
+                placeholder="DELETE" />
+              <div className="flex gap-3">
+                <button onClick={() => { setDeleteModalOpen(false); setDeleteConfirmText(''); }} disabled={deleting}
+                  className="flex-1 px-4 py-2.5 rounded-xl text-sm font-semibold text-white/60 hover:bg-white/5 transition-all disabled:opacity-50">
+                  Cancel
+                </button>
+                <button onClick={deleteAccount} disabled={deleteConfirmText !== 'DELETE' || deleting}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold text-white transition-all disabled:opacity-40"
+                  style={{ background: deleteConfirmText === 'DELETE' ? '#DC2626' : 'rgba(239,68,68,0.3)' }}>
+                  {deleting ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                  {deleting ? 'Deleting...' : 'Delete Forever'}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </AppLayout>
   );
 }

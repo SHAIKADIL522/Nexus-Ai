@@ -35,7 +35,13 @@ export async function GET(req: NextRequest) {
     const client = new MongoClient(process.env.MONGODB_URI!);
     await client.connect();
     const db = client.db('nexus-ai');
-    await db.collection('users').updateOne(
+
+    // ✅ FIX: capture the upserted/matched _id so we can sign it into the JWT.
+    // Without this, Google-login users have no userId in their session,
+    // which breaks every userId-keyed route (settings, conversations,
+    // account management) added in the Settings/Account/Chat-persistence
+    // upgrade — those routes have no email-fallback lookup by design.
+    const result = await db.collection('users').findOneAndUpdate(
       { email: googleUser.email },
       {
         $set: {
@@ -45,15 +51,31 @@ export async function GET(req: NextRequest) {
           googleId: googleUser.id,
           updatedAt: new Date(),
         },
-        $setOnInsert: { createdAt: new Date(), provider: 'google' },
+        // tokenVersion lets "logout all devices" work the same way for
+        // Google users as for email/password users (see src/lib/auth.ts).
+        $setOnInsert: { createdAt: new Date(), provider: 'google', tokenVersion: 0 },
       },
-      { upsert: true }
+      { upsert: true, returnDocument: 'after' }
     );
     await client.close();
 
-    // Create JWT
+    const userDoc = result; // findOneAndUpdate returns the document directly (driver v5+) or null
+    const userId = userDoc?._id?.toString();
+
+    if (!userId) {
+      // Should be unreachable with upsert: true, but fail loudly rather than
+      // silently issuing a userId-less token if the driver version differs.
+      throw new Error('Failed to resolve user id after upsert');
+    }
+
+    // Create JWT — now includes userId, matching login/route.ts's shape.
     const token = jwt.sign(
-      { email: googleUser.email, name: googleUser.name },
+      {
+        userId,
+        email: googleUser.email,
+        name: googleUser.name,
+        tokenVersion: userDoc?.tokenVersion ?? 0,
+      },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
